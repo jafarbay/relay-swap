@@ -16,17 +16,16 @@ config = {
         1868 : "https://soneium.drpc.org",          # Soneium 0xbA9986D2381edf1DA03B0B9c1f8b00dc4AacC369
         8453 : "https://base.drpc.org",          # Base 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913
         10 : "https://optimism.drpc.org",          # Optimism 0x0b2c639c533813f4aa9d7837caf62653d097ff85
+        # Добавляй нужные RPC-ссылки по Chain ID
     },
     'from_chain': 10,
     'to_chain': 10,
     'from_token_address': "0x0000000000000000000000000000000000000000",  # ETH
     'to_token_address': "0x0b2c639c533813f4aa9d7837caf62653d097ff85",    # USDC
-    'slippage_tolerance': '2',
+    'slippage_tolerance': '1',
     'swap_back': True,
-    'random_delay_range': (10, 60),
-    'swap_cycles_range': (10, 15),  # Новое: диапазон количества циклов свапа
-    'eth_swap_percentage': 0.2,  # Процент ETH для свапа (например, 0.2 = 20%)
-
+    'random_delay_range': (3, 7),
+    'swap_cycles_range': (3, 5),  # Новое: диапазон количества циклов свапа
 }
 
 # ==== Цветные логи ==== 
@@ -86,9 +85,8 @@ def get_token_balance(account, token_address, chain_id):
 
 def get_eth_to_swap(account):
     balance, _ = get_balance(account, config['from_chain'])
-    portion = int(balance * config.get('eth_swap_percentage', 0.2))
+    portion = int(balance * 0.2)
     return portion, Web3.from_wei(portion, 'ether')
-
 
 def get_usdc_to_swap(account):
     balance = get_token_balance(account, config['to_token_address'], config['to_chain'])
