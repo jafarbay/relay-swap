@@ -6,7 +6,7 @@ import time
 import random
 import os
 
-# ==== Конфигурация ==== 
+# ==== Конфигурация ====
 config = {
     'rpcs': {
         130: "https://unichain-rpc.publicnode.com",     # UniChain 0x078d782b760474a361dda0af3839290b0ef57ad6
@@ -16,7 +16,6 @@ config = {
         1868 : "https://soneium.drpc.org",          # Soneium 0xbA9986D2381edf1DA03B0B9c1f8b00dc4AacC369
         8453 : "https://base.drpc.org",          # Base 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913
         10 : "https://optimism.drpc.org",          # Optimism 0x0b2c639c533813f4aa9d7837caf62653d097ff85
-        # Добавляй нужные RPC-ссылки по Chain ID
     },
     'from_chain': 10,
     'to_chain': 10,
@@ -24,11 +23,17 @@ config = {
     'to_token_address': "0x0b2c639c533813f4aa9d7837caf62653d097ff85",    # USDC
     'slippage_tolerance': '1',
     'swap_back': True,
-    'random_delay_range': (3, 7),
-    'swap_cycles_range': (3, 5),  # Новое: диапазон количества циклов свапа
+    'random_delay_range': (15, 60),
+    'swap_cycles_range': (10, 15),
+    'max_retries': 3,
+    'retry_delay': (5, 10),
+    'default_gas': {
+        'approve': 100000,
+        'swap': 300000
+    }
 }
 
-# ==== Цветные логи ==== 
+# ==== Цветные логи ====
 def log(msg, color="white"):
     colors = {
         "red": "\033[91m",
@@ -56,12 +61,21 @@ def read_private_keys():
         return keys
     except FileNotFoundError:
         log("❌ Файл private_key.txt не найден", "red")
-        log("📝 Создаю пустой файл private_key.txt", "yellow")
         with open('private_key.txt', 'w'): pass
         return []
     except Exception as e:
         log(f"❌ Ошибка: {e}", "red")
         return []
+
+async def get_current_nonce(web3, address):
+    """Безопасное получение nonce с повторными попытками"""
+    for _ in range(3):
+        try:
+            return web3.eth.get_transaction_count(address)
+        except Exception as e:
+            log(f"⚠️ Ошибка получения nonce: {e}", "yellow")
+            await asyncio.sleep(1)
+    raise Exception("Не удалось получить nonce")
 
 def get_balance(account, chain_id):
     web3 = get_web3(chain_id)
@@ -113,15 +127,46 @@ async def get_quote(account, from_token, to_token, amount):
     }
 
     async with aiohttp.ClientSession() as session:
-        async with session.post(url, headers=headers, json=json_data) as response:
-            if response.status == 200:
-                return await response.json()
-            else:
+        try:
+            async with session.post(url, headers=headers, json=json_data, timeout=30) as response:
+                if response.status == 200:
+                    return await response.json()
                 text = await response.text()
-                log(f"❌ Ошибка API: {text}", "red")
+                log(f"❌ Ошибка API ({response.status}): {text[:200]}", "red")
                 return None
+        except Exception as e:
+            log(f"❌ Ошибка запроса котировки: {str(e)[:200]}", "red")
+            return None
+
+async def send_transaction_with_retry(web3, tx, account, max_retries=3):
+    """Отправка транзакции с обработкой ошибок nonce"""
+    for attempt in range(max_retries):
+        try:
+            # Обновляем nonce перед каждой попыткой
+            tx['nonce'] = await get_current_nonce(web3, account.address)
+            
+            # Подписываем и отправляем транзакцию
+            signed_tx = account.sign_transaction(tx)
+            tx_hash = web3.eth.send_raw_transaction(signed_tx.raw_transaction)
+            return tx_hash
+        except ValueError as e:
+            if 'nonce too low' in str(e):
+                log(f"⚠️ Nonce слишком низкий, попытка {attempt + 1}/{max_retries}", "yellow")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(1)
+                    continue
+                raise
+            raise
+        except Exception as e:
+            log(f"❌ Ошибка отправки транзакции: {str(e)[:200]}", "red")
+            if attempt < max_retries - 1:
+                await asyncio.sleep(1)
+                continue
+            raise
+    raise Exception("Не удалось отправить транзакцию после нескольких попыток")
 
 async def send_transaction_bundle(account, quote_data):
+    max_retries = config['max_retries']
     try:
         all_steps = quote_data['steps']
     except KeyError as e:
@@ -129,59 +174,125 @@ async def send_transaction_bundle(account, quote_data):
         return False
 
     nonce_cache = {}
-    step_idx = 0
-    for step in all_steps:
+    
+    for step_idx, step in enumerate(all_steps):
+        step_id = step.get('id', '').lower()
+        step_kind = step.get('kind', '').lower()
+        
+        if step_kind != 'transaction':
+            log(f"⚠️ Пропускаем шаг {step_idx+1} (не транзакция): {step_id}", "yellow")
+            continue
+            
+        log(f"🔹 Обрабатываем шаг {step_idx+1}: {step.get('description', '')}", "cyan")
+        
         for idx, item in enumerate(step.get('items', [])):
             tx_data = item.get('data')
             if not tx_data:
-                log(f"⚠️ Нет данных (step {step_idx}, item {idx})", "yellow")
+                log(f"⚠️ Нет данных (step {step_idx+1}, item {idx+1})", "yellow")
                 continue
 
-            try:
-                chain_id = int(tx_data['chainId'])
-                web3 = get_web3(chain_id)
-                if chain_id not in nonce_cache:
-                    nonce_cache[chain_id] = web3.eth.get_transaction_count(account.address)
+            for attempt in range(max_retries):
+                try:
+                    chain_id = int(tx_data['chainId'])
+                    web3 = get_web3(chain_id)
+                    
+                    # Получаем актуальный nonce
+                    current_nonce = await get_current_nonce(web3, account.address)
+                    if chain_id in nonce_cache:
+                        nonce_cache[chain_id] = max(nonce_cache[chain_id], current_nonce)
+                    else:
+                        nonce_cache[chain_id] = current_nonce
 
-                tx = {
-                    'from': account.address,
-                    'to': Web3.to_checksum_address(tx_data['to']),
-                    'value': int(tx_data['value']),
-                    'data': tx_data['data'],
-                    'chainId': chain_id,
-                    'maxFeePerGas': int(tx_data['maxFeePerGas']),
-                    'maxPriorityFeePerGas': int(tx_data['maxPriorityFeePerGas']),
-                    'nonce': nonce_cache[chain_id],
-                    'type': 2
-                }
+                    tx = {
+                        'from': account.address,
+                        'to': Web3.to_checksum_address(tx_data['to']),
+                        'value': int(tx_data['value']),
+                        'data': tx_data['data'],
+                        'chainId': chain_id,
+                        'maxFeePerGas': int(tx_data['maxFeePerGas']),
+                        'maxPriorityFeePerGas': int(tx_data['maxPriorityFeePerGas']),
+                        'nonce': nonce_cache[chain_id],
+                        'type': 2
+                    }
 
-                gas_estimate = web3.eth.estimate_gas(tx)
-                tx['gas'] = int(gas_estimate * 1.1)
+                    if 'approve' in step_id:
+                        log(f"🔐 Обнаружен approve токена (попытка {attempt+1}/{max_retries})", "yellow")
+                        tx['gas'] = config['default_gas']['approve']
+                    else:
+                        try:
+                            gas_estimate = web3.eth.estimate_gas(tx)
+                            tx['gas'] = int(gas_estimate * 1.3)
+                            log(f"🔁 Обнаружен swap (попытка {attempt+1}/{max_retries})", "yellow")
+                        except Exception as e:
+                            log(f"⚠️ Ошибка оценки газа: {e}", "yellow")
+                            tx['gas'] = config['default_gas']['swap']
 
-                signed = web3.eth.account.sign_transaction(tx, account.key)
-                tx_hash = web3.eth.send_raw_transaction(signed.raw_transaction)
+                    # Отправка транзакции с обработкой nonce
+                    tx_hash = await send_transaction_with_retry(web3, tx, account)
+                    log(f"🚀 [{step_idx+1}.{idx+1}] Отправлено: {tx_hash.hex()}", "cyan")
 
-                log(f"🚀 [{step_idx+1}.{idx+1}] Отправлено: {tx_hash.hex()}", "cyan")
+                    # Ожидаем подтверждения
+                    receipt = web3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)
+                    if receipt['status'] == 1:
+                        log(f"✅ Подтверждено: {tx_hash.hex()}", "green")
+                        nonce_cache[chain_id] += 1
+                        break
+                    else:
+                        log(f"❌ Ошибка выполнения: {tx_hash.hex()}", "red")
+                        if attempt < max_retries - 1:
+                            delay = random.randint(*config['retry_delay'])
+                            log(f"⏳ Повтор через {delay} сек...", "yellow")
+                            await asyncio.sleep(delay)
+                            continue
+                        return False
 
-                receipt = web3.eth.wait_for_transaction_receipt(tx_hash)
-                if receipt['status'] == 1:
-                    log(f"✅ Подтверждено: {tx_hash.hex()}", "green")
-                else:
-                    log(f"❌ Ошибка выполнения: {tx_hash.hex()}", "red")
+                    delay = random.randint(*config['random_delay_range'])
+                    log(f"⏳ Задержка: {delay} сек.", "yellow")
+                    await asyncio.sleep(delay)
+
+                except Exception as e:
+                    log(f"❌ Ошибка транзакции (попытка {attempt+1}): {str(e)[:200]}", "red")
+                    if 'nonce too low' in str(e):
+                        nonce_cache[chain_id] = await get_current_nonce(web3, account.address)
+                    if attempt < max_retries - 1:
+                        delay = random.randint(*config['retry_delay'])
+                        log(f"⏳ Повтор через {delay} сек...", "yellow")
+                        await asyncio.sleep(delay)
+                        continue
                     return False
 
-                nonce_cache[chain_id] += 1
-                delay = random.randint(*config['random_delay_range'])
-                log(f"⏳ Задержка: {delay} сек.", "yellow")
-                time.sleep(delay)
-
-            except Exception as e:
-                log(f"❌ Ошибка транзакции: {e}", "red")
-                return False
-
-        step_idx += 1
-
     return True
+
+async def process_swap(account, from_token, to_token, get_amount_func, token_from_name, token_to_name):
+    amount, amount_view = get_amount_func(account)
+    if amount < (10**13 if from_token == config['from_token_address'] else 10000):
+        log(f"⚠️ Недостаточно {token_from_name} для свапа", "yellow")
+        return True
+
+    for attempt in range(config['max_retries']):
+        log(f"🔁 {token_from_name} → {token_to_name}: {amount_view} {token_from_name} (попытка {attempt+1})", "cyan")
+        quote = await get_quote(account, from_token, to_token, amount)
+        
+        if not quote:
+            if attempt < config['max_retries'] - 1:
+                delay = random.randint(*config['retry_delay'])
+                log(f"⏳ Повторный запрос котировки через {delay} сек...", "yellow")
+                await asyncio.sleep(delay)
+                continue
+            log(f"❌ Не удалось получить котировку {token_from_name} → {token_to_name}", "red")
+            return False
+
+        success = await send_transaction_bundle(account, quote)
+        if success:
+            return True
+        elif attempt < config['max_retries'] - 1:
+            delay = random.randint(*config['retry_delay'])
+            log(f"⏳ Повторный свап через {delay} сек...", "yellow")
+            await asyncio.sleep(delay)
+            continue
+    
+    log(f"❌ Превышено количество попыток свапа {token_from_name} → {token_to_name}", "red")
+    return False
 
 async def process_account(private_key):
     try:
@@ -199,40 +310,34 @@ async def process_account(private_key):
                 log(f"⚠️ Баланс ETH слишком низкий ({balance_eth} ETH)", "yellow")
                 break
 
-            # === ETH → USDC === 
-            eth_amount, eth_view = get_eth_to_swap(account)
-            if eth_amount < 10**13:
-                log("⚠️ Недостаточно ETH для свапа", "yellow")
-            else:
-                log(f"🔁 ETH → USDC: {eth_view} ETH", "cyan")
-                quote = await get_quote(account, config['from_token_address'], config['to_token_address'], eth_amount)
-                if quote:
-                    success = await send_transaction_bundle(account, quote)
-                    if not success:
-                        break
-                else:
-                    log("❌ Не удалось получить котировку ETH → USDC", "red")
+            # ETH → USDC
+            if not await process_swap(
+                account,
+                config['from_token_address'],
+                config['to_token_address'],
+                get_eth_to_swap,
+                "ETH",
+                "USDC"
+            ):
+                break
 
             if config['swap_back']:
-                time.sleep(10)
-
-                # === USDC → ETH === 
-                usdc_amount, usdc_view = get_usdc_to_swap(account)
-                if usdc_amount < 10000:
-                    log("⚠️ Недостаточно USDC для свапа", "yellow")
-                else:
-                    log(f"🔁 USDC → ETH: {usdc_view} USDC", "cyan")
-                    quote = await get_quote(account, config['to_token_address'], config['from_token_address'], usdc_amount)
-                    if quote:
-                        success = await send_transaction_bundle(account, quote)
-                        if not success:
-                            break
-                    else:
-                        log("❌ Не удалось получить котировку USDC → ETH", "red")
+                await asyncio.sleep(10)
+                
+                # USDC → ETH
+                if not await process_swap(
+                    account,
+                    config['to_token_address'],
+                    config['from_token_address'],
+                    get_usdc_to_swap,
+                    "USDC",
+                    "ETH"
+                ):
+                    break
 
             delay = random.randint(*config['random_delay_range'])
             log(f"⏳ Задержка между циклами: {delay} сек.", "yellow")
-            time.sleep(delay)
+            await asyncio.sleep(delay)
 
     except Exception as e:
         log(f"❌ Ошибка аккаунта: {e}", "red")
@@ -254,7 +359,7 @@ async def main():
         if i < len(private_keys) - 1:
             delay = random.randint(5, 15)
             log(f"⏳ Пауза перед следующим аккаунтом: {delay} сек.", "yellow")
-            time.sleep(delay)
+            await asyncio.sleep(delay)
 
     log("\n✅ Все аккаунты обработаны", "green")
 
